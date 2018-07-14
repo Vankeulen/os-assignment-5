@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <fcntl.h>
 
 #define DEBUG
 
@@ -117,6 +118,11 @@ Add the following functionality.
 #   define dprintt(a,b)
 #endif
 
+// positions of read/write file descriptors
+// `int fd[2]` passed to pipe()
+#define READ 0
+#define WRITE 1
+
 using namespace std;
 
 // http://man7.org/linux/man-pages/man7/signal-safety.7.html
@@ -128,6 +134,10 @@ enum STATE { NEW, RUNNING, WAITING, READY, TERMINATED };
 
 struct PCB {
 	STATE state;
+	// Added toParent/toChild file descriptors	
+	// To hold pipe fd information
+	int toParent[2];	// pipe to parent
+	int toChild[2];		// pipe to child
 	const char* name;	// name of the executable
 	int pid;			// process id from fork();
 	int ppid;			// parent process id
@@ -142,6 +152,11 @@ PCB* idle;
 
 struct sigaction* tick;
 struct sigaction* child;
+// Added this action struct to hold information about
+// the callback registered for SIGTRAP
+struct sigaction* check;
+// Added this to hold pid of main process that reacts to signals
+int schedulerPid;
 int send_signals_pid;
 
 // http://www.cplusplus.com/reference/list/list/
@@ -334,7 +349,6 @@ void moveProcessToBack(int index) {
 
 
 
-
 void scheduler(int signum) {
 	WRITES("---- entering scheduler\n");
 	assert(signum == SIGALRM);
@@ -352,7 +366,25 @@ void scheduler(int signum) {
 		// Initialize new process
 		tocont = getProcessByIndex(anyNew);
 		if ((tocont->pid = fork()) == 0) {
-			execl("/bin/sh", "sh", "-c", tocont->name, (char*)0);
+			char command[1024];
+			snprintf(command, 1024, "%s %d %d %d %d %d",
+				tocont->name,
+				schedulerPid,
+				tocont->toParent[READ],
+				tocont->toParent[WRITE],
+				tocont->toChild[READ],
+				tocont->toChild[WRITE]
+			);
+
+			assertsyscall(close(tocont->toParent[WRITE]), == 0);
+			assertsyscall(close(tocont->toChild[READ]), == 0);
+			// Executes command, but waits for it and resumes
+			// and will terminate if command fails.
+			//system(command);
+			// Executes command, async.
+			// Should never return, 
+			execl("/bin/sh", "sh", "-c", command, (char*)0);
+			// perror() ends the program if it does
 			perror("execl");
 		}
 		tocont->started = sys_time;
@@ -454,17 +486,26 @@ void process_done(int signum) {
 	WRITES("---- leaving process_done\n");
 }
 
+// Executed in signalhandler for SIGTRAP
+void checkPipe(int signum) {
+	WRITES("Yo got checkPipe signal\n");
+}
 
 /*
 ** set up the "hardware"
 */
 void boot() {
 	sys_time = 0;
-
+	
 	ISV[SIGALRM] = scheduler;
 	ISV[SIGCHLD] = process_done;
+	// Inserts checkPipe into ISV matrix
+	ISV[SIGTRAP] = checkPipe;
 	tick = create_handler(SIGALRM, ISR);
 	child = create_handler(SIGCHLD, ISR);
+	// and creates/registers handler for SIGTRAP
+	check = create_handler(SIGTRAP, ISR);
+
 
 	// start up clock interrupt
 	int ret;
@@ -503,6 +544,8 @@ void initProcessList(int argc, char** argv) {
 		PCB* pcb = new PCB();
 		
 		pcb->state = NEW;
+		assertsyscall(pipe(pcb->toParent), == 0);
+		assertsyscall(pipe(pcb->toChild), == 0);
 		pcb->ppid = ppid;
 		pcb->pid = -1;
 		pcb->started = -1;
@@ -519,7 +562,7 @@ void initProcessList(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-
+	schedulerPid = getpid();
 	for (int i = 0; i < argc; i++) {
 		//printf("Arg %d %s\n", i, argv[i]);
 	}
@@ -548,6 +591,8 @@ int main(int argc, char** argv) {
 	int s;
 	assertsyscall(waitpid(send_signals_pid, &s, 0), == send_signals_pid);
 	delete(tick);
+	// Deletes created handler
+	delete(check);
 	delete(child);
 	delete(idle);
 	kill(0, SIGTERM);
