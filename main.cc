@@ -1,5 +1,6 @@
 
 #include <iostream>
+#include <sstream>  
 #include <list>
 #include <iterator>
 #include <unistd.h>
@@ -95,7 +96,7 @@ Add the following functionality.
    c) Restart the idle process to use the rest of the time slice.
 */
 
-#define NUM_SECONDS 5
+#define NUM_SECONDS 10
 #define EVER ;;
 
 #define assertsyscall(x, y) if(!((x) y)){int err = errno; \
@@ -366,25 +367,29 @@ void scheduler(int signum) {
 		// Initialize new process
 		tocont = getProcessByIndex(anyNew);
 		if ((tocont->pid = fork()) == 0) {
-			char command[1024];
-			snprintf(command, 1024, "%s %d %d %d %d %d",
-				tocont->name,
-				schedulerPid,
-				tocont->toParent[READ],
-				tocont->toParent[WRITE],
-				tocont->toChild[READ],
-				tocont->toChild[WRITE]
-			);
+			char arg1[32]; snprintf(arg1, 32, "%d", tocont->toParent[READ]);
+			char arg2[32]; snprintf(arg2, 32, "%d", tocont->toParent[WRITE]);
+			char arg3[32]; snprintf(arg3, 32, "%d", tocont->toChild[READ]);
+			char arg4[32]; snprintf(arg4, 32, "%d", tocont->toChild[WRITE]);
 
+			// executes the other program
+			// We pass in the #'s for the file descriptors
+			// This is the only way we could figure out to enable
+			// multiple child processes to work with their OWN pipes
+			// instead of trying to access the same pipes as other children.
+			//
+			// For whatever reason
+			// 		we need to provide the entire ARGV to execl
+			// execl(path/to/binary, binary, [args,] NULL)
+			// 		instead of just a single string
+			execl(tocont->name, tocont->name, arg1, arg2, arg3, arg4, NULL);
+			
+			// Close pipes that will be unused in this process
+			// after having forked the child
 			assertsyscall(close(tocont->toParent[WRITE]), == 0);
 			assertsyscall(close(tocont->toChild[READ]), == 0);
-			// Executes command, but waits for it and resumes
-			// and will terminate if command fails.
-			//system(command);
-			// Executes command, async.
-			// Should never return, 
-			execl("/bin/sh", "sh", "-c", command, (char*)0);
-			// perror() ends the program if it does
+			
+			//execl("/bin/sh", "sh", "-c", command, (char*)0)
 			perror("execl");
 		}
 		tocont->started = sys_time;
@@ -449,37 +454,49 @@ void process_done(int signum) {
 		} else {
 			PCB* process = getProcessByPID(cpid);
 			if (process == NULL) {
-				WRITES("NULL");
-			}
+				// If we do not have a PCB entry for the PID
+				// Then it is a 'system' process
+				// And we are done.
+				// Kill any other processes in the group.
+				WRITES("DONE\n");
+				if (kill(0, SIGTERM) == -1) {
+					WRITES("in process_done kill error: ");
+					WRITEI(errno);
+					WRITES("\n");
+					return;
+				}
+			} else {
 
-			WRITES("process exited: ");
-			WRITEI(cpid);
+				WRITES("process exited: ");
+				WRITEI(cpid);
 
-			WRITES("\nProcess Name:             ");
-			WRITES(process->name);
+				WRITES("\nProcess Name:             ");
+				WRITES(process->name);
 
-			WRITES("\nInteruptions:             ");
-			WRITEI(process->interrupts);
+				WRITES("\nInteruptions:             ");
+				WRITEI(process->interrupts);
 
-			WRITES("\nSwitches:                 ");
-			WRITEI(process->switches);
+				WRITES("\nSwitches:                 ");
+				WRITEI(process->switches);
 
-			WRITES("\nTotal time to completion: ");
-			WRITEI(sys_time - process->started);
+				WRITES("\nTotal time to completion: ");
+				WRITEI(sys_time - process->started);
 
-			WRITES("\nTotal cpu time:           ");
-			WRITEI(process->cputime);
+				WRITES("\nTotal cpu time:           ");
+				WRITEI(process->cputime);
 
-			WRITES("\n");
-			process->state = TERMINATED;
-			running = idle;
-			
-			if (kill(idle->pid, SIGCONT) == -1) {
-				WRITES("in process_done kill error: ");
-				WRITEI(errno);
 				WRITES("\n");
-				return;
+				process->state = TERMINATED;
+				running = idle;
+				
+				if (kill(idle->pid, SIGCONT) == -1) {
+					WRITES("in process_done kill error: ");
+					WRITEI(errno);
+					WRITES("\n");
+					return;
+				}
 			}
+
 		}
 	}
 
@@ -488,7 +505,104 @@ void process_done(int signum) {
 
 // Executed in signalhandler for SIGTRAP
 void checkPipe(int signum) {
-	WRITES("Yo got checkPipe signal\n");
+	WRITES("---- entering checkPipe\n");
+	
+	// Grab a list iterator to traverse all processes
+	// We need to poll all pipes
+	// to see which child process requested a service
+	list<PCB*>::iterator it = processes.begin();
+	for (int i = 0; i < processes.size(); i++) {
+		// Get the process entry
+		PCB* item = *it;
+		// Aliases for pipes
+		int* toParent = item->toParent;
+		int* toChild = item->toChild;
+		// Buffer to hold info from pipe
+		char buf[1];
+		// Try to read from pipe
+		// If nothing is available, instantly finishes
+		// And comes back as zero.
+		int numRead = read(toParent[READ], buf, 1);
+
+		// -1 means error
+		if (numRead <= -1) {
+			WRITES("FAILURE to read from pipe ");
+			WRITEI(toParent[READ]);
+			WRITES(" errno is ");
+			WRITEI(errno);
+			WRITES("\n");
+		} else if (numRead == 0) {
+			// Nothing to read
+		} else {
+			// Read a byte from pipe
+			// That holds the code of service requested
+			int code = buf[0];
+			WRITES("Read code ");
+			WRITEI(code);
+			WRITES("\n");
+			// stringstream
+			// so we can make use of the (ostream << PCB) operator
+			// to return information more easily.
+			stringstream ss;
+
+			if (code == 1) {
+				// Request for sys_time
+				WRITES("Sending sys_time\n");
+				ss << sys_time;
+				// Convert to c-string so we can write() it
+				const char* cstr = ss.str().c_str();
+				write(toChild[WRITE], cstr, strlen(cstr));
+
+			} else if (code == 2) {
+				// Request for PCB info
+				WRITES("Sending calling process info\n");
+				ss << item;
+				const char* cstr = ss.str().c_str();
+				// Convert to c-string so we can write() it
+				write(toChild[WRITE], cstr, strlen(cstr));
+			} else if (code == 3) {
+				WRITES("Sending process list\n");
+				// Request for entire PCB list
+				// Iterate entire list again
+				list<PCB*>::iterator it2 = processes.begin();
+				for (int k = 0; k < processes.size(); k++) {
+					ss << "process " << k << ":\n";
+					PCB* item2 = *it2;
+					ss << item2;
+					it2++;
+				}
+
+				const char* cstr = ss.str().c_str();
+				// Convert to c-string so we can write() it
+				write(toChild[WRITE], cstr, strlen(cstr));
+			} else if (code == 4) {
+				// Request to print something out to parent's stdout
+				// Can change this buffersize down to 4 to demonstrate that
+				// this will not have issues with really large requests.
+				int BUFSIZE = 32;
+				char buf[BUFSIZE+1];
+				buf[BUFSIZE] = '\0';
+				
+				int numRead2;
+				// Read rest of input from pipe
+				while ((numRead2 = read(toParent[READ], buf, BUFSIZE)) > 0) {
+					// And just redirect output to stdout
+					WRITES(buf);
+					// Reset the buffer between each read
+					memset(buf, 0, BUFSIZE);
+				}
+				// Make sure to flush when done.
+				WRITES("\n");
+				
+			}
+
+		}
+		// Move iterator forward to next PCB entry.
+		++it;	
+	}
+
+	WRITES("---- leaving checkPipe\n");
+
 }
 
 /*
@@ -544,6 +658,7 @@ void initProcessList(int argc, char** argv) {
 		PCB* pcb = new PCB();
 		
 		pcb->state = NEW;
+		// Add pipes to PCB
 		assertsyscall(pipe(pcb->toParent), == 0);
 		assertsyscall(pipe(pcb->toChild), == 0);
 		pcb->ppid = ppid;
@@ -563,6 +678,7 @@ void initProcessList(int argc, char** argv) {
 
 int main(int argc, char** argv) {
 	schedulerPid = getpid();
+	printf("PID to target for scheduler interupts: %d\n", schedulerPid);
 	for (int i = 0; i < argc; i++) {
 		//printf("Arg %d %s\n", i, argv[i]);
 	}
@@ -588,6 +704,7 @@ int main(int argc, char** argv) {
 	running = idle;
 	cout << running;
 
+	printf("\nWaiting for everything to end, on process %d\n", getpid());
 	int s;
 	assertsyscall(waitpid(send_signals_pid, &s, 0), == send_signals_pid);
 	delete(tick);
@@ -596,4 +713,5 @@ int main(int argc, char** argv) {
 	delete(child);
 	delete(idle);
 	kill(0, SIGTERM);
+
 }
